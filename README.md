@@ -57,6 +57,7 @@ This project aims to retrofit the popular Eratec prayer time clocks with the ESP
 
 <img src="https://github.com/esrfkos/AwqatSalahEsp8266/blob/main/resources/20230316_164444.jpg" alt="Logo" width="400" >
 <!-- GETTING STARTED -->
+
 ## Getting Started
 
 Readme is being updated. Stay tuned
