@@ -1,0 +1,7 @@
+# Personal credentials, see secrets.example.h
+secrets.h
+
+# Build output
+build/
+.pio/
+.vscode/
