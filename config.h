@@ -6,8 +6,11 @@
 // Location
 // ---------------------------------------------------------------------------
 
-// Awqat Salah city id, see "Finding your city id" in the README.
-#define AWQAT_CITY_ID      "XXXXX"
+// City id and time zone are only the defaults for the first start,
+// afterwards they are changed in the web interface.
+
+// Awqat Salah city id, see "Finding your city id" in the README ("" = set in the web interface).
+#define AWQAT_CITY_ID      ""
 
 // POSIX time zone string incl. daylight saving rules.
 // Europe/Berlin, Vienna, Zurich, Amsterdam, Brussels, Paris: "CET-1CEST,M3.5.0,M10.5.0/3"
@@ -18,6 +21,24 @@
 
 #define NTP_SERVER_1       "europe.pool.ntp.org"
 #define NTP_SERVER_2       "pool.ntp.org"
+
+// ---------------------------------------------------------------------------
+// Network setup and OTA
+// ---------------------------------------------------------------------------
+
+// Host name in the home network: web interface http://awqatsalah.local, OTA port name
+#define DEVICE_NAME              "awqatsalah"
+
+// Setup access point "AwqatSalah-XXXX" (last digits of the MAC address)
+#define SETUP_AP_PREFIX          "AwqatSalah-"
+
+// Password of the setup access point, the web interface (user "admin") and OTA
+// until a new one is set in the web interface. Min. 8 characters. Change it!
+#define DEFAULT_DEVICE_PASSWORD  "awqatsalah"
+
+// With a configured but unreachable Wi-Fi the setup access point stays open this
+// long, then the clock restarts and tries the Wi-Fi again.
+#define SETUP_PORTAL_TIMEOUT_MS  (5UL * 60UL * 1000UL)
 
 // ---------------------------------------------------------------------------
 // Behaviour

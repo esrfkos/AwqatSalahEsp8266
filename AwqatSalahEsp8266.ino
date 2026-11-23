@@ -7,9 +7,12 @@
  * Optionally it shows the current time and date, the temperature/humidity of a
  * BME280 and uses a DS3231 RTC as backup clock.
  *
- * Settings:     config.h
- * Credentials:  secrets.h (copy from secrets.example.h)
- * Docs:         README.md
+ * Wi-Fi, API account and city are set up in the browser (setup access point
+ * on first start, later http://awqatsalah.local). Firmware updates over Wi-Fi (OTA).
+ *
+ * Hardware/defaults: config.h
+ * Optional defaults for credentials: secrets.h (copy from secrets.example.h)
+ * Docs:              README.md
  */
 
 #include "config.h"
@@ -19,12 +22,16 @@
   #include <HTTPClient.h>
   #include <WiFiClientSecure.h>
   #include <esp_sntp.h>
+  #include <ESPmDNS.h>
 #else
   #include <ESP8266WiFi.h>
   #include <ESP8266HTTPClient.h>
   #include <WiFiClientSecure.h>
   #include <coredecls.h>        // settimeofday_cb()
+  #include <ESP8266mDNS.h>
 #endif
+
+#include <ArduinoOTA.h>
 
 #include <ArduinoJson.h>
 #include <LittleFS.h>
@@ -42,12 +49,8 @@
 
 #include "src/TA6932Chain.h"
 #include "src/PrayerTable.h"
-
-#if __has_include("secrets.h")
-  #include "secrets.h"
-#else
-  #error "secrets.h not found: copy secrets.example.h to secrets.h and fill in your credentials"
-#endif
+#include "src/Settings.h"
+#include "src/WebPortal.h"
 
 #if TEMPERATURE_SOURCE == TEMP_BME280 && !USE_BME280
   #error "TEMPERATURE_SOURCE is TEMP_BME280 but USE_BME280 is 0"
@@ -71,7 +74,7 @@
 // ---------------------------------------------------------------------------
 
 static const char AWQAT_LOGIN_URL[] = "https://awqatsalah.diyanet.gov.tr/Auth/Login";
-static const char AWQAT_RANGE_URL[] = "https://awqatsalah.diyanet.gov.tr/api/PrayerTime/" AWQAT_RANGE "/" AWQAT_CITY_ID;
+static const char AWQAT_PRAYER_URL[] = "https://awqatsalah.diyanet.gov.tr/api/PrayerTime/" AWQAT_RANGE "/";   // + city id
 
 // ---------------------------------------------------------------------------
 // Prayer times
@@ -88,6 +91,18 @@ static const uint16_t MINUTES_PER_DAY = 24 * 60;
 static PrayerTable prayerTable;
 static const char PRAYER_FILE[] = "/prayer_times.bin";
 static bool fsAvailable = false;
+
+// ---------------------------------------------------------------------------
+// Settings, web interface, OTA
+// ---------------------------------------------------------------------------
+
+static Settings settings;
+
+static bool saveSettings();
+static void statusHtml(String& html);
+static WebPortal portal(settings, saveSettings, statusHtml);
+
+static bool otaActive = false;
 
 // ---------------------------------------------------------------------------
 // Display
@@ -111,6 +126,8 @@ static bool fsAvailable = false;
 static const uint8_t SEG_BLANK = 0b00000000;
 static const uint8_t SEG_DASH  = 0b00001000;
 static const uint8_t SEG_DOT   = 0b10000000;
+static const uint8_t SEG_A     = 0b00111111;
+static const uint8_t SEG_P     = 0b00101111;
 
 static const uint8_t SEG_DIGITS[10] = {
   0b01110111,  // 0
@@ -435,14 +452,14 @@ static void setupTime()
   // It only sets a flag, the I2C access happens in loop().
 #if defined(ESP32)
   sntp_set_time_sync_notification_cb(onNtpSync);
-  configTzTime(TIME_ZONE, NTP_SERVER_1, NTP_SERVER_2);
+  configTzTime(settings.timeZone.c_str(), NTP_SERVER_1, NTP_SERVER_2);
 #else
   settimeofday_cb([](bool fromSntp) {
     if (fromSntp) {
       ntpSynced = true;
     }
   });
-  configTime(TIME_ZONE, NTP_SERVER_1, NTP_SERVER_2);
+  configTime(settings.timeZone.c_str(), NTP_SERVER_1, NTP_SERVER_2);
 #endif
 
   if (WiFi.status() == WL_CONNECTED) {
@@ -468,12 +485,22 @@ static void setupTime()
 // Network
 // ===========================================================================
 
-static void setupWifi()
+// Connects to the configured network, false if none is configured or it is not reachable
+static bool setupWifi()
 {
-  WiFi.persistent(false);       // don't wear out the flash with the credentials
+  if (!settings.hasWifi()) {
+    Serial.println("No Wi-Fi configured");
+    return false;
+  }
+  WiFi.persistent(false);       // the settings live in LittleFS, not in the SDK config
+#if defined(ESP32)
+  WiFi.setHostname(DEVICE_NAME);  // must be set before the mode on ESP32
+#else
+  WiFi.hostname(DEVICE_NAME);
+#endif
   WiFi.mode(WIFI_STA);
   WiFi.setAutoReconnect(true);
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFi.begin(settings.wifiSsid.c_str(), settings.wifiPassword.c_str());
 
   Serial.print("Connecting to Wi-Fi");
   unsigned long start = millis();
@@ -483,11 +510,41 @@ static void setupWifi()
   }
   Serial.println();
 
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.printf("Connected, IP %s\n", WiFi.localIP().toString().c_str());
-  } else {
-    Serial.println("WARNING: Wi-Fi not connected yet, retrying in the background");
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.printf("Wi-Fi \"%s\" not reachable\n", settings.wifiSsid.c_str());
+    return false;
   }
+  Serial.printf("Connected, IP %s, http://%s.local\n", WiFi.localIP().toString().c_str(), DEVICE_NAME);
+  return true;
+}
+
+static void setupOta()
+{
+  ArduinoOTA.setHostname(DEVICE_NAME);
+  ArduinoOTA.setPassword(settings.devicePassword.c_str());
+  ArduinoOTA.onStart([]() {
+    otaActive = true;
+    Serial.println("OTA update started");
+  });
+  ArduinoOTA.onProgress([](unsigned int done, unsigned int total) {
+    static int lastPercent = -1;
+    int percent = total ? (int)((uint64_t)done * 99 / total) : 0;
+    if (percent != lastPercent) {
+      lastPercent = percent;
+      showTwoDigits(POS_TOP_LEFT, percent);   // progress in the top-left field
+      display.flush();
+    }
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("OTA update finished, restarting");
+  });
+  ArduinoOTA.onError([](ota_error_t error) {
+    otaActive = false;
+    lastShownMinute = -1;   // restore the normal display
+    Serial.printf("OTA error %u\n", (unsigned)error);
+  });
+  ArduinoOTA.begin();       // also announces DEVICE_NAME.local via mDNS
+  MDNS.addService("http", "tcp", 80);
 }
 
 // Logs in and returns the access token (empty string on failure).
@@ -503,8 +560,8 @@ static String awqatLogin(WiFiClientSecure& client)
   http.addHeader("Content-Type", "application/json");
 
   JSON_DOC(body, 256);
-  body["email"]    = AWQAT_EMAIL;
-  body["password"] = AWQAT_PASSWORD;
+  body["email"]    = settings.awqatEmail;
+  body["password"] = settings.awqatPassword;
   String json;
   serializeJson(body, json);
 
@@ -537,6 +594,10 @@ static uint8_t fetchPrayerTimes(uint32_t todayKey)
     Serial.println("Fetch skipped: no Wi-Fi");
     return 0;
   }
+  if (!settings.hasAwqatAccount() || !settings.hasCity()) {
+    Serial.println("Fetch skipped: API account or city id missing, see web interface");
+    return 0;
+  }
 
   WiFiClientSecure client;
   client.setInsecure();   // the server certificate is not verified, see README
@@ -548,7 +609,8 @@ static uint8_t fetchPrayerTimes(uint32_t todayKey)
 
   HTTPClient http;
   http.useHTTP10(true);
-  if (!http.begin(client, AWQAT_RANGE_URL)) {
+  String url = String(AWQAT_PRAYER_URL) + settings.cityId;
+  if (!http.begin(client, url)) {
     Serial.println("Prayer times: begin() failed");
     return 0;
   }
@@ -602,7 +664,7 @@ static uint8_t fetchPrayerTimes(uint32_t todayKey)
                 received[0].day, received[0].month, received[n - 1].day, received[n - 1].month,
                 prayerTable.size());
 
-  if (fsAvailable && !prayerTable.save(LittleFS, PRAYER_FILE, AWQAT_CITY_ID)) {
+  if (fsAvailable && !prayerTable.save(LittleFS, PRAYER_FILE, settings.cityId.c_str())) {
     Serial.println("WARNING: could not save the prayer times to flash");
   }
   return n;
@@ -621,12 +683,17 @@ static void renderDisplay(const struct tm* now)
     showPrayerRow(i, today ? today->minutes[i] : NO_TIME);
   }
 
+  if (portal.inSetupMode()) {
+    display.set(POS_TOP_LEFT, SEG_A);
+    display.set(POS_TOP_LEFT + 1, SEG_P);
+  } else {
 #if TOP_LEFT_FIELD == FIELD_COUNTDOWN
   const DayTimes* tomorrow = now ? prayerTable.find(nextDateKey(*now)) : nullptr;
   showTwoDigits(POS_TOP_LEFT, now ? minutesUntilNextPrayer(today, tomorrow, now->tm_hour * 60 + now->tm_min) : -1);
 #elif TOP_LEFT_FIELD == FIELD_HUMIDITY
   showTwoDigits(POS_TOP_LEFT, readHumidity());
 #endif
+  }
 
 #if TEMPERATURE_SOURCE != TEMP_NONE
   showTwoDigits(POS_TEMPERATURE, readTemperature());
@@ -643,18 +710,74 @@ static void renderDisplay(const struct tm* now)
 
 static void setupStorage()
 {
+  settings.setDefaults();
 #if defined(ESP32)
   fsAvailable = LittleFS.begin(true);   // format on first use
 #else
   fsAvailable = LittleFS.begin();       // formats automatically on first use
 #endif
   if (!fsAvailable) {
-    Serial.println("WARNING: LittleFS not available, prayer times are not kept across restarts");
+    Serial.println("WARNING: LittleFS not available, settings and prayer times are not kept across restarts");
     return;
   }
-  if (prayerTable.load(LittleFS, PRAYER_FILE, AWQAT_CITY_ID)) {
+  if (settings.load(LittleFS)) {
+    Serial.println("Settings loaded");
+  }
+  if (prayerTable.load(LittleFS, PRAYER_FILE, settings.cityId.c_str())) {
     Serial.printf("Loaded %u days from flash\n", prayerTable.size());
   }
+}
+
+static bool saveSettings()
+{
+  return fsAvailable && settings.save(LittleFS);
+}
+
+// Status block of the web interface
+static void statusHtml(String& html)
+{
+  html += F("<table>");
+  auto row = [&html](const char* label, const String& value) {
+    html += F("<tr><td>");
+    html += label;
+    html += F("</td><td>");
+    html += value;
+    html += F("</td></tr>");
+  };
+  char buf[48];
+
+  time_t t = time(nullptr);
+  struct tm now;
+  localtime_r(&t, &now);
+  if (timeIsValid()) {
+    strftime(buf, sizeof(buf), "%d.%m.%Y %H:%M", &now);
+    row("Time", buf);
+    const DayTimes* today = prayerTable.find(dateKeyOf(now));
+    static const char* const NAMES[PRAYER_COUNT] = { "Fajr", "Sunrise", "Dhuhr", "Asr", "Maghrib", "Isha" };
+    for (uint8_t i = 0; i < PRAYER_COUNT; i++) {
+      if (today) {
+        snprintf(buf, sizeof(buf), "%02u:%02u", today->minutes[i] / 60, today->minutes[i] % 60);
+      } else {
+        strcpy(buf, "--:--");
+      }
+      row(NAMES[i], buf);
+    }
+    snprintf(buf, sizeof(buf), "%u", prayerTable.daysFrom(dateKeyOf(now)));
+    row("Stored days ahead", buf);
+  } else {
+    row("Time", "unknown");
+  }
+  if (!settings.hasAwqatAccount() || !settings.hasCity()) {
+    row("API", "<b>account or city id missing</b>");
+  }
+  snprintf(buf, sizeof(buf), "%s, %d dBm", WiFi.localIP().toString().c_str(), WiFi.RSSI());
+  row("Wi-Fi", buf);
+  snprintf(buf, sizeof(buf), "%lu h", millis() / 3600000UL);
+  row("Uptime", buf);
+  snprintf(buf, sizeof(buf), "%u bytes", (unsigned)ESP.getFreeHeap());
+  row("Free heap", buf);
+  row("Firmware", __DATE__ " " __TIME__);
+  html += F("</table>");
 }
 
 
@@ -673,7 +796,19 @@ void setup()
 
   setupStorage();
   setupSensors();
-  setupWifi();
+
+  if (setupWifi()) {
+    portal.beginStation();
+    setupOta();
+  } else {
+    // no or unreachable network: open the setup access point. With a configured
+    // network the clock restarts after the timeout and tries again.
+    String mac = WiFi.macAddress();
+    mac.replace(":", "");
+    portal.beginSetup(String(SETUP_AP_PREFIX) + mac.substring(8),
+                      settings.hasWifi() ? SETUP_PORTAL_TIMEOUT_MS : 0);
+    renderDisplay(nullptr);   // shows "AP"
+  }
   setupTime();
 
   Serial.println("Started");
@@ -681,6 +816,19 @@ void setup()
 
 void loop()
 {
+  portal.handle();
+  if (portal.inSetupMode()) {
+    if (portal.setupTimedOut()) {
+      Serial.println("Setup portal timeout, retrying the configured Wi-Fi");
+      ESP.restart();
+    }
+  } else {
+    ArduinoOTA.handle();
+  }
+  if (otaActive) {
+    return;                 // keep the progress display, no downloads during an update
+  }
+
 #if USE_RTC_DS3231
   // after an NTP sync keep the RTC in step (flag set in the SNTP callback)
   if (ntpSynced) {
@@ -692,7 +840,7 @@ void loop()
 #endif
 
   if (!timeIsValid()) {
-    delay(1000);
+    delay(10);              // keep the web interface responsive
     return;
   }
 
@@ -710,14 +858,16 @@ void loop()
   bool haveToday = prayerTable.find(todayKey) != nullptr;
   bool afterFetchTime = now.tm_hour * 60 + now.tm_min >= FETCH_HOUR * 60 + FETCH_MINUTE;
 
-  bool urgent  = !haveToday && (!fetchAttempted || millis() - lastFetchAttemptMs >= retryDelayMs);
-  bool refresh = haveToday && afterFetchTime && now.tm_yday != lastRefreshYday &&
-                 prayerTable.daysFrom(todayKey) < REFRESH_DAYS_AHEAD;
+  bool canFetch = !portal.inSetupMode() && settings.hasAwqatAccount() && settings.hasCity();
+  bool manual   = portal.consumeRefreshRequest();
+  bool urgent   = canFetch && !haveToday && (!fetchAttempted || millis() - lastFetchAttemptMs >= retryDelayMs);
+  bool refresh  = canFetch && (manual || (haveToday && afterFetchTime && now.tm_yday != lastRefreshYday &&
+                                          prayerTable.daysFrom(todayKey) < REFRESH_DAYS_AHEAD));
 
   if (urgent || refresh) {
     fetchAttempted = true;
     lastFetchAttemptMs = millis();
-    if (refresh) {
+    if (refresh && !manual) {
       lastRefreshYday = now.tm_yday;
     }
     Serial.println(urgent ? "Fetching prayer times (today missing)..." : "Refreshing prayer times...");
@@ -738,5 +888,5 @@ void loop()
     renderDisplay(&now);
   }
 
-  delay(200);
+  delay(10);
 }

@@ -57,7 +57,9 @@ of Religious Affairs (Diyanet) and shows them on the original 7-segment display.
 - Few API requests: a new download only when fewer than 5 days are left, failed attempts are retried with growing pauses
 - Shows `--:--` until today's times are known
 - No modified libraries needed: the TA6932 driver is part of the sketch (`src/TA6932Chain`)
-- Credentials kept out of git (`secrets.h`)
+- Setup in the browser: Wi-Fi, API account, city and time zone, no recompiling
+  (setup access point with captive portal on first start, later `http://awqatsalah.local`)
+- Firmware updates over Wi-Fi (Arduino OTA), progress shown on the display
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -188,7 +190,7 @@ curl -s -H "Authorization: Bearer $TOKEN" https://awqatsalah.diyanet.gov.tr/api/
 curl -s -H "Authorization: Bearer $TOKEN" https://awqatsalah.diyanet.gov.tr/api/PrayerTime/Daily/<cityId>
 ```
 
-The `id` of your city is the value for `AWQAT_CITY_ID`. A daily response looks like this
+Enter the `id` of your city in the web interface. A daily response looks like this
 (shortened):
 
 ```json
@@ -204,22 +206,64 @@ The `id` of your city is the value for `AWQAT_CITY_ID`. A daily response looks l
    ```sh
    git clone https://github.com/esrfkos/AwqatSalahEsp8266.git
    ```
-2. Copy `secrets.example.h` to `secrets.h` and enter your Wi-Fi and Awqat Salah credentials.
-3. Set your city id and time zone in `config.h`, check the hardware block of your board.
-4. Open `AwqatSalahEsp8266.ino`, select your board (e.g. *ESP32 Dev Module*, *NodeMCU 1.0*, *LOLIN(WEMOS) D1 mini*) and the port, then upload.
-5. Open the serial monitor at 115200 baud to watch the start-up.
+2. Check the hardware block of your board in `config.h`.
+3. Open `AwqatSalahEsp8266.ino`, select your board (e.g. *ESP32 Dev Module*, *NodeMCU 1.0*,
+   *LOLIN(WEMOS) D1 mini*) and the USB port, then upload. On the ESP8266 choose a flash size
+   with file system and OTA, e.g. *4MB (FS:2MB OTA:~1019KB)*.
+4. Open the serial monitor at 115200 baud to watch the start-up.
+
+`secrets.h` is optional: credentials entered there are only defaults for the first start
+(copy `secrets.example.h`).
+
+### First setup
+
+1. After the first upload the display shows **`AP`** in the top-left field.
+2. Connect a phone or laptop to the Wi-Fi **`AwqatSalah-XXXX`**, password `awqatsalah`
+   (`DEFAULT_DEVICE_PASSWORD`). The settings page opens automatically; if not, open
+   `http://192.168.4.1`.
+3. Enter your Wi-Fi, the Awqat Salah API account, the city id and a new **device password**,
+   then *Save and restart*.
+4. The clock connects to your Wi-Fi, downloads the prayer times and shows them.
+
+If the configured Wi-Fi is not reachable at start-up (e.g. after a router change), the setup
+access point opens again for 5 minutes, then the clock restarts and tries the Wi-Fi again.
+
+### Web interface
+
+In the home network open **`http://awqatsalah.local`** (or the IP address from the serial
+monitor). Log in as user `admin` with the device password. The page shows the status
+(time, today's prayer times, stored days, Wi-Fi signal, free memory) and the settings.
+*Download prayer times now* starts a download immediately (counts against the API limit).
+Password fields stay empty; leave them empty to keep the stored passwords.
+
+### Firmware updates over Wi-Fi (OTA)
+
+1. Computer and clock must be in the same network.
+2. In the Arduino IDE choose *Tools → Port → awqatsalah at 192.168.x.x* (network port).
+3. Upload as usual; the IDE asks for the device password.
+4. The top-left field shows the progress in percent, then the clock restarts.
+
+Settings and stored prayer times are kept during updates.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
 
 ## Configuration
 
-All settings are in [`config.h`](config.h):
+Wi-Fi, API account, city id, time zone and device password are set in the
+[web interface](#web-interface) and stored in LittleFS (`/settings.json`).
+The values in `config.h` / `secrets.h` are only the defaults for the first start.
+
+Compile-time settings in [`config.h`](config.h):
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `AWQAT_CITY_ID` | `"XXXXX"` | your city id |
-| `TIME_ZONE` | Central Europe | POSIX TZ string incl. DST rules |
+| `AWQAT_CITY_ID` | `""` | default city id |
+| `TIME_ZONE` | Central Europe | default POSIX TZ string incl. DST rules |
+| `DEVICE_NAME` | `"awqatsalah"` | host name: `http://awqatsalah.local`, OTA port |
+| `SETUP_AP_PREFIX` | `"AwqatSalah-"` | name of the setup access point |
+| `DEFAULT_DEVICE_PASSWORD` | `"awqatsalah"` | device password until one is set in the web interface |
+| `SETUP_PORTAL_TIMEOUT_MS` | 5 min | setup access point timeout when a Wi-Fi is configured |
 | `NTP_SERVER_1/2` | pool.ntp.org | time servers |
 | `AWQAT_RANGE` | `"Monthly"` | days per download: `"Monthly"`, `"Weekly"` or `"Daily"` |
 | `REFRESH_DAYS_AHEAD` | 5 | download again when fewer days (incl. today) are stored |
@@ -237,8 +281,8 @@ All settings are in [`config.h`](config.h):
 
 Contradicting settings (e.g. humidity without BME280) stop the build with a clear error.
 
-Credentials go into `secrets.h` (ignored by git):
-`WIFI_SSID`, `WIFI_PASSWORD`, `AWQAT_EMAIL`, `AWQAT_PASSWORD`.
+Optional defaults in `secrets.h` (ignored by git):
+`WIFI_SSID`, `WIFI_PASSWORD`, `AWQAT_EMAIL`, `AWQAT_PASSWORD`, `DEVICE_PASSWORD`.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -248,12 +292,15 @@ Credentials go into `secrets.h` (ignored by git):
 ```
 setup()
  ├─ init display, show "--:--"
- ├─ mount LittleFS, load the stored days (/prayer_times.bin)
+ ├─ mount LittleFS, load settings (/settings.json) and stored days (/prayer_times.bin)
  ├─ init I2C sensors (BME280 / DS3231), continue without them if missing
- ├─ connect Wi-Fi (max. 20 s, then continues in the background)
+ ├─ connect Wi-Fi (max. 20 s)
+ │    ok   → web interface + OTA, http://awqatsalah.local
+ │    fail → setup access point with captive portal, "AP" on the display
  └─ start NTP; if no sync within 10 s, set the system time from the DS3231
 
-loop()  (every 200 ms)
+loop()
+ ├─ web interface / captive portal, OTA
  ├─ after each NTP sync: write the time to the DS3231
  ├─ today not stored?                → download now, on failure retry after 5, 10, 20 … min (max. 6 h)
  ├─ fewer than 5 days left, ≥ 03:05?  → one download attempt per day
@@ -268,7 +315,7 @@ loop()  (every 200 ms)
   so it never has to fit into RAM as a whole. Days are matched by their date
   (`gregorianDateShort`, e.g. `12.03.2023`), so it does not matter whether the
   API returns the calendar month or the next 30 days.
-- The stored days are bound to `AWQAT_CITY_ID`; after changing the city the old
+- The stored days are bound to the city id; after changing the city the old
   file is ignored and a new download starts.
 - Without internet the clock still needs the current time: on boards without
   DS3231 the stored times are only shown once NTP has worked after a restart.
@@ -276,6 +323,9 @@ loop()  (every 200 ms)
   **not verified**. This keeps the firmware independent of certificate
   renewals, but a network attacker could read the API credentials. Use a
   dedicated API account and a trusted network.
+- The web interface uses plain HTTP with basic auth, the device password is
+  readable for anyone in the same network. Change the default device password
+  and only use the clock in a network you trust.
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -284,12 +334,16 @@ loop()  (every 200 ms)
 
 | Serial output / symptom | Cause |
 |---|---|
-| `secrets.h not found` (compile error) | copy `secrets.example.h` to `secrets.h` |
+| Display shows `AP` | no Wi-Fi configured or not reachable: connect to `AwqatSalah-XXXX` and enter the Wi-Fi |
+| `awqatsalah.local` does not open | some Android devices do not support mDNS, use the IP address from the serial monitor or the router |
+| No network port in the Arduino IDE | computer and clock in different networks, or mDNS blocked by the firewall |
+| `Fetch skipped: API account or city id missing` | enter them in the web interface |
+| Forgot the device password | upload once via USB with the whole flash erased (ESP8266: *Tools → Erase Flash → All Flash Contents*, ESP32: *Tools → Erase All Flash Before Sketch Upload → Enabled*), then set up again |
 | `Unsupported board` (compile error) | select an ESP32 or ESP8266 board |
 | `TEMPERATURE_SOURCE is ... but ...` (compile error) | enable the sensor or choose another source in `config.h` |
 | `Login failed: HTTP 401` | wrong Awqat Salah credentials |
 | `Login failed: HTTP 429` or `403` | daily request limit reached, wait until the next day |
-| `Prayer times failed: HTTP 404` | wrong `AWQAT_CITY_ID` |
+| `Prayer times failed: HTTP 404` | wrong city id |
 | `HTTP -1 connection refused` | no internet or not enough free heap for TLS |
 | `BME280 not found` | check wiring and `BME280_I2C_ADDRESS` (0x76 or 0x77); sensor id 0x56-0x58 is a BMP280 without humidity |
 | `DS3231 not found` | check SDA/SCL wiring and the RTC supply |
@@ -298,7 +352,7 @@ loop()  (every 200 ms)
 | `response contains no valid days` | the API answer changed; please open an issue with the serial output |
 | Clock/date board stays dark | `DISPLAY_CHIPS` is 2 or the chip 3 pins are wrong |
 | Board does not boot with the display connected | strapping pin pulled at power-up, see wiring |
-| Times are one hour off | wrong `TIME_ZONE` |
+| Times are one hour off | wrong time zone in the web interface |
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
 
@@ -311,8 +365,9 @@ loop()  (every 200 ms)
 - [x] Current time and date on the clock board
 - [x] ESP32 support
 - [x] Offline operation: monthly download stored in flash
+- [x] Setup in the browser (captive portal) and web interface
+- [x] Firmware updates over Wi-Fi (OTA)
 - [ ] Highlight the current prayer time
-- [ ] Wi-Fi setup without recompiling (captive portal, e.g. WiFiManager)
 - [ ] Adhan / buzzer output at prayer time
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
