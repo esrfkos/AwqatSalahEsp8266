@@ -27,8 +27,10 @@
 #endif
 
 #include <ArduinoJson.h>
+#include <LittleFS.h>
 #include <Wire.h>
 #include <time.h>
+#include <initializer_list>
 #include <sys/time.h>
 
 #if USE_RTC_DS3231
@@ -39,6 +41,7 @@
 #endif
 
 #include "src/TA6932Chain.h"
+#include "src/PrayerTable.h"
 
 #if __has_include("secrets.h")
   #include "secrets.h"
@@ -68,26 +71,23 @@
 // ---------------------------------------------------------------------------
 
 static const char AWQAT_LOGIN_URL[] = "https://awqatsalah.diyanet.gov.tr/Auth/Login";
-static const char AWQAT_DAILY_URL[] = "https://awqatsalah.diyanet.gov.tr/api/PrayerTime/Daily/" AWQAT_CITY_ID;
+static const char AWQAT_RANGE_URL[] = "https://awqatsalah.diyanet.gov.tr/api/PrayerTime/" AWQAT_RANGE "/" AWQAT_CITY_ID;
 
 // ---------------------------------------------------------------------------
 // Prayer times
 // ---------------------------------------------------------------------------
-
-enum Prayer : uint8_t { FAJR, SUNRISE, DHUHR, ASR, MAGHRIB, ISHA, PRAYER_COUNT };
 
 // JSON field names in the API response, same order as enum Prayer
 static const char* const PRAYER_KEYS[PRAYER_COUNT] = {
   "fajr", "sunrise", "dhuhr", "asr", "maghrib", "isha"
 };
 
-static const uint16_t NO_TIME = 0xFFFF;
 static const uint16_t MINUTES_PER_DAY = 24 * 60;
 
-// minutes since local midnight, NO_TIME if unknown
-static uint16_t prayerMinutes[PRAYER_COUNT] = {
-  NO_TIME, NO_TIME, NO_TIME, NO_TIME, NO_TIME, NO_TIME
-};
+// downloaded days, persisted in flash so the clock works without internet
+static PrayerTable prayerTable;
+static const char PRAYER_FILE[] = "/prayer_times.bin";
+static bool fsAvailable = false;
 
 // ---------------------------------------------------------------------------
 // Display
@@ -164,10 +164,11 @@ static volatile bool ntpSynced = false;   // set from the SNTP callback
 // Scheduler state
 // ---------------------------------------------------------------------------
 
-static int  lastFetchYday   = -1;         // tm_yday of the last successful download
-static bool fetchAttempted  = false;
+static bool fetchAttempted     = false;
 static unsigned long lastFetchAttemptMs = 0;
-static int  lastShownMinute = -1;
+static unsigned long retryDelayMs = FETCH_RETRY_MIN_MS;   // grows after each failure
+static int  lastRefreshYday    = -1;      // day of the last planned refresh attempt
+static int  lastShownMinute    = -1;
 
 
 // ===========================================================================
@@ -188,10 +189,9 @@ static void showTwoDigits(uint8_t pos, int value, uint8_t extraSegmentsSecond = 
 }
 
 // HH:MM row of a prayer time, "--:--" if unknown
-static void showPrayerRow(uint8_t prayer)
+static void showPrayerRow(uint8_t prayer, uint16_t minutes)
 {
   uint8_t pos = POS_FIRST_PRAYER + prayer * DIGITS_PER_PRAYER;
-  uint16_t minutes = prayerMinutes[prayer];
 
   if (minutes == NO_TIME) {
     display.set(pos,     SEG_DASH);
@@ -251,25 +251,89 @@ static uint16_t parseHHMM(const char* s)
   return h * 60 + m;
 }
 
-static bool hasPrayerTimes()
+static uint8_t twoDigits(const char* s)
 {
-  return prayerMinutes[FAJR] != NO_TIME;
+  return (s[0] - '0') * 10 + (s[1] - '0');
+}
+
+static bool allDigits(const char* s, std::initializer_list<uint8_t> positions)
+{
+  for (uint8_t p : positions) {
+    if (!isdigit((unsigned char)s[p])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Date of an API entry: "dd.MM.yyyy" (gregorianDateShort) or "yyyy-MM-dd..." (ISO 8601).
+// Returns false on malformed input.
+static bool parseDate(const char* s, uint16_t& year, uint8_t& month, uint8_t& day)
+{
+  if (!s || strlen(s) < 10) {
+    return false;
+  }
+  if (s[2] == '.' && s[5] == '.' && allDigits(s, {0, 1, 3, 4, 6, 7, 8, 9})) {
+    day   = twoDigits(s);
+    month = twoDigits(s + 3);
+    year  = twoDigits(s + 6) * 100 + twoDigits(s + 8);
+  } else if (s[4] == '-' && s[7] == '-' && allDigits(s, {0, 1, 2, 3, 5, 6, 8, 9})) {
+    year  = twoDigits(s) * 100 + twoDigits(s + 2);
+    month = twoDigits(s + 5);
+    day   = twoDigits(s + 8);
+  } else {
+    return false;
+  }
+  return year >= 2000 && year < 2100 && month >= 1 && month <= 12 && day >= 1 && day <= 31;
+}
+
+// One element of the API's "data" array -> DayTimes. Returns false if incomplete.
+static bool parseDay(JsonObjectConst entry, DayTimes& out)
+{
+  if (!parseDate(entry["gregorianDateShort"].as<const char*>(), out.year, out.month, out.day) &&
+      !parseDate(entry["gregorianDateLongIso8601"].as<const char*>(), out.year, out.month, out.day)) {
+    return false;
+  }
+  for (uint8_t i = 0; i < PRAYER_COUNT; i++) {
+    out.minutes[i] = parseHHMM(entry[PRAYER_KEYS[i]].as<const char*>());
+    if (out.minutes[i] == NO_TIME) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static uint32_t dateKeyOf(const struct tm& t)
+{
+  return DayTimes::dateKey(t.tm_year + 1900, t.tm_mon + 1, t.tm_mday);
 }
 
 #if TOP_LEFT_FIELD == FIELD_COUNTDOWN
-// Minutes until the next prayer (incl. sunrise), -1 if unknown
-static int minutesUntilNextPrayer(int nowMinutes)
+// Date key of the day after t (mktime handles month/year ends and DST)
+static uint32_t nextDateKey(const struct tm& t)
 {
-  if (!hasPrayerTimes()) {
+  struct tm next = t;
+  next.tm_mday += 1;
+  next.tm_hour = 12;
+  next.tm_isdst = -1;
+  mktime(&next);
+  return dateKeyOf(next);
+}
+
+// Minutes until the next prayer (incl. sunrise), -1 if unknown
+static int minutesUntilNextPrayer(const DayTimes* today, const DayTimes* tomorrow, int nowMinutes)
+{
+  if (!today) {
     return -1;
   }
   for (uint8_t i = 0; i < PRAYER_COUNT; i++) {
-    if (prayerMinutes[i] > nowMinutes) {
-      return prayerMinutes[i] - nowMinutes;
+    if (today->minutes[i] > nowMinutes) {
+      return today->minutes[i] - nowMinutes;
     }
   }
-  // after isha: count down to tomorrow's fajr (approximated with today's)
-  return MINUTES_PER_DAY - nowMinutes + prayerMinutes[FAJR];
+  // after isha: tomorrow's fajr, approximated with today's if not downloaded
+  uint16_t fajr = tomorrow ? tomorrow->minutes[FAJR] : today->minutes[FAJR];
+  return MINUTES_PER_DAY - nowMinutes + fajr;
 }
 #endif
 
@@ -465,12 +529,13 @@ static String awqatLogin(WiFiClientSecure& client)
   return response["data"]["accessToken"] | "";
 }
 
-// Downloads today's prayer times into prayerMinutes[]. Returns true on success.
-static bool fetchPrayerTimes()
+// Downloads several days (AWQAT_RANGE) and merges them into prayerTable.
+// Returns the number of valid days received, 0 on failure.
+static uint8_t fetchPrayerTimes(uint32_t todayKey)
 {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("Fetch skipped: no Wi-Fi");
-    return false;
+    return 0;
   }
 
   WiFiClientSecure client;
@@ -478,14 +543,14 @@ static bool fetchPrayerTimes()
 
   String token = awqatLogin(client);
   if (token.length() == 0) {
-    return false;
+    return 0;
   }
 
   HTTPClient http;
   http.useHTTP10(true);
-  if (!http.begin(client, AWQAT_DAILY_URL)) {
+  if (!http.begin(client, AWQAT_RANGE_URL)) {
     Serial.println("Prayer times: begin() failed");
-    return false;
+    return 0;
   }
   http.addHeader("Authorization", "Bearer " + token);
 
@@ -493,43 +558,54 @@ static bool fetchPrayerTimes()
   if (code != HTTP_CODE_OK) {
     Serial.printf("Prayer times failed: HTTP %d %s\n", code, HTTPClient::errorToString(code).c_str());
     http.end();
-    return false;
+    return 0;
   }
 
-  // only keep the fields we need
+  // The "data" array is parsed one element at a time, so a monthly response
+  // never has to fit into RAM as a whole.
+  Stream& stream = http.getStream();
+  if (!stream.find("\"data\"") || !stream.find("[")) {
+    Serial.println("Prayer times: no data array in the response");
+    http.end();
+    return 0;
+  }
+
   JSON_DOC(filter, 256);
   for (const char* key : PRAYER_KEYS) {
-    filter["data"][0][key] = true;
+    filter[key] = true;
   }
+  filter["gregorianDateShort"] = true;
+  filter["gregorianDateLongIso8601"] = true;
 
-  JSON_DOC(doc, 512);
-  DeserializationError err = deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
-  http.end();
-  if (err) {
-    Serial.printf("Prayer times: invalid JSON (%s)\n", err.c_str());
-    return false;
-  }
-
-  JsonObject today = doc["data"][0];
-  if (today.isNull()) {
-    Serial.println("Prayer times: response contains no data");
-    return false;
-  }
-
-  uint16_t parsed[PRAYER_COUNT];
-  for (uint8_t i = 0; i < PRAYER_COUNT; i++) {
-    parsed[i] = parseHHMM(today[PRAYER_KEYS[i]].as<const char*>());
-    if (parsed[i] == NO_TIME) {
-      Serial.printf("Prayer times: invalid value for %s\n", PRAYER_KEYS[i]);
-      return false;
+  static DayTimes received[PrayerTable::CAPACITY];   // static: keep it off the stack
+  uint8_t n = 0;
+  do {
+    JSON_DOC(entry, 512);
+    DeserializationError err = deserializeJson(entry, stream, DeserializationOption::Filter(filter));
+    if (err) {
+      Serial.printf("Prayer times: invalid JSON (%s)\n", err.c_str());
+      break;
     }
+    if (n < PrayerTable::CAPACITY && parseDay(entry.as<JsonObjectConst>(), received[n])) {
+      n++;
+    }
+  } while (stream.findUntil(",", "]"));
+  http.end();
+
+  if (n == 0) {
+    Serial.println("Prayer times: response contains no valid days");
+    return 0;
   }
 
-  memcpy(prayerMinutes, parsed, sizeof(prayerMinutes));
-  for (uint8_t i = 0; i < PRAYER_COUNT; i++) {
-    Serial.printf("  %-8s %02u:%02u\n", PRAYER_KEYS[i], prayerMinutes[i] / 60, prayerMinutes[i] % 60);
+  prayerTable.merge(received, n, todayKey);
+  Serial.printf("Received %u days (%02u.%02u. - %02u.%02u.), %u days stored\n", n,
+                received[0].day, received[0].month, received[n - 1].day, received[n - 1].month,
+                prayerTable.size());
+
+  if (fsAvailable && !prayerTable.save(LittleFS, PRAYER_FILE, AWQAT_CITY_ID)) {
+    Serial.println("WARNING: could not save the prayer times to flash");
   }
-  return true;
+  return n;
 }
 
 
@@ -540,12 +616,14 @@ static bool fetchPrayerTimes()
 // now: current local time, nullptr if unknown
 static void renderDisplay(const struct tm* now)
 {
+  const DayTimes* today = now ? prayerTable.find(dateKeyOf(*now)) : nullptr;
   for (uint8_t i = 0; i < PRAYER_COUNT; i++) {
-    showPrayerRow(i);
+    showPrayerRow(i, today ? today->minutes[i] : NO_TIME);
   }
 
 #if TOP_LEFT_FIELD == FIELD_COUNTDOWN
-  showTwoDigits(POS_TOP_LEFT, now ? minutesUntilNextPrayer(now->tm_hour * 60 + now->tm_min) : -1);
+  const DayTimes* tomorrow = now ? prayerTable.find(nextDateKey(*now)) : nullptr;
+  showTwoDigits(POS_TOP_LEFT, now ? minutesUntilNextPrayer(today, tomorrow, now->tm_hour * 60 + now->tm_min) : -1);
 #elif TOP_LEFT_FIELD == FIELD_HUMIDITY
   showTwoDigits(POS_TOP_LEFT, readHumidity());
 #endif
@@ -560,6 +638,27 @@ static void renderDisplay(const struct tm* now)
 
 
 // ===========================================================================
+// Storage
+// ===========================================================================
+
+static void setupStorage()
+{
+#if defined(ESP32)
+  fsAvailable = LittleFS.begin(true);   // format on first use
+#else
+  fsAvailable = LittleFS.begin();       // formats automatically on first use
+#endif
+  if (!fsAvailable) {
+    Serial.println("WARNING: LittleFS not available, prayer times are not kept across restarts");
+    return;
+  }
+  if (prayerTable.load(LittleFS, PRAYER_FILE, AWQAT_CITY_ID)) {
+    Serial.printf("Loaded %u days from flash\n", prayerTable.size());
+  }
+}
+
+
+// ===========================================================================
 // Arduino entry points
 // ===========================================================================
 
@@ -570,8 +669,9 @@ void setup()
 
   delay(500);             // give the display drivers time to power up
   display.begin(DISPLAY_BRIGHTNESS);
-  renderDisplay(nullptr); // "--:--" until the first download
+  renderDisplay(nullptr); // "--:--" until the time is known
 
+  setupStorage();
   setupSensors();
   setupWifi();
   setupTime();
@@ -600,19 +700,35 @@ void loop()
   struct tm now;
   localtime_r(&nowEpoch, &now);
 
-  // Download once a day after FETCH_HOUR:FETCH_MINUTE, or immediately if nothing
-  // has been loaded since boot. Failed attempts are retried every FETCH_RETRY_MS.
+  // Download plan:
+  //  - today missing (first start, empty flash, data used up): download now,
+  //    retry after failures with growing pauses (FETCH_RETRY_MIN_MS .. MAX_MS)
+  //  - fewer than REFRESH_DAYS_AHEAD days left: one attempt per day after
+  //    FETCH_HOUR:FETCH_MINUTE, the stored days bridge failed attempts
+  // This keeps the number of API requests far below the daily limit.
+  uint32_t todayKey = dateKeyOf(now);
+  bool haveToday = prayerTable.find(todayKey) != nullptr;
   bool afterFetchTime = now.tm_hour * 60 + now.tm_min >= FETCH_HOUR * 60 + FETCH_MINUTE;
-  bool fetchDue = !hasPrayerTimes() || (now.tm_yday != lastFetchYday && afterFetchTime);
-  bool retryOk  = !fetchAttempted || millis() - lastFetchAttemptMs >= FETCH_RETRY_MS;
 
-  if (fetchDue && retryOk) {
+  bool urgent  = !haveToday && (!fetchAttempted || millis() - lastFetchAttemptMs >= retryDelayMs);
+  bool refresh = haveToday && afterFetchTime && now.tm_yday != lastRefreshYday &&
+                 prayerTable.daysFrom(todayKey) < REFRESH_DAYS_AHEAD;
+
+  if (urgent || refresh) {
     fetchAttempted = true;
     lastFetchAttemptMs = millis();
-    Serial.println("Fetching prayer times...");
-    if (fetchPrayerTimes()) {
-      lastFetchYday = now.tm_yday;
+    if (refresh) {
+      lastRefreshYday = now.tm_yday;
+    }
+    Serial.println(urgent ? "Fetching prayer times (today missing)..." : "Refreshing prayer times...");
+
+    bool ok = fetchPrayerTimes(todayKey) > 0 && prayerTable.find(todayKey) != nullptr;
+    if (ok) {
+      retryDelayMs = FETCH_RETRY_MIN_MS;
       lastShownMinute = -1;   // force redraw
+    } else if (urgent) {
+      retryDelayMs = min(retryDelayMs * 2, (unsigned long)FETCH_RETRY_MAX_MS);
+      Serial.printf("Next attempt in %lu min\n", retryDelayMs / 60000UL);
     }
   }
 

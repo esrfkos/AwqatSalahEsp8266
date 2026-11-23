@@ -23,12 +23,21 @@
 // Behaviour
 // ---------------------------------------------------------------------------
 
-// Daily refresh of the prayer times (local time)
+// How many days are downloaded at once: "Monthly", "Weekly" or "Daily".
+// The days are stored in flash, so the clock keeps working without internet.
+// The API allows only a few requests per day and endpoint, see README.
+#define AWQAT_RANGE        "Monthly"
+
+// A new download is started when fewer than this many days (incl. today) are stored.
+// One attempt per day at FETCH_HOUR:FETCH_MINUTE (local time).
+#define REFRESH_DAYS_AHEAD 5
 #define FETCH_HOUR         3
 #define FETCH_MINUTE       5
 
-// Wait time before a failed download is retried
-#define FETCH_RETRY_MS     (5UL * 60UL * 1000UL)
+// If today's times are missing, failed downloads are retried after a pause that
+// doubles after every failure, from MIN to MAX.
+#define FETCH_RETRY_MIN_MS (5UL * 60UL * 1000UL)
+#define FETCH_RETRY_MAX_MS (6UL * 60UL * 60UL * 1000UL)
 
 // How long setup() waits for Wi-Fi / NTP before continuing
 #define WIFI_TIMEOUT_MS    20000UL

@@ -47,13 +47,15 @@ of Religious Affairs (Diyanet) and shows them on the original 7-segment display.
 ## Features
 
 - Runs on **ESP32** and **ESP8266**, the board is detected automatically
-- Downloads the six daily times (fajr/imsak, sunrise, dhuhr, asr, maghrib, isha) once a day
+- Downloads the six daily times (fajr/imsak, sunrise, dhuhr, asr, maghrib, isha) for a whole month
+  and stores them in flash: the clock keeps working for weeks without internet and survives restarts
 - Current time and date on the clock board (third TA6932 chip)
 - Time from NTP with automatic daylight saving time (POSIX time zone string)
 - Temperature from a BME280 or the DS3231
 - Top-left field: countdown to the next prayer time, or humidity from the BME280
 - Optional DS3231 RTC keeps the time when Wi-Fi or NTP are unavailable
-- Shows `--:--` until the first download, keeps the last times if a download fails and retries every 5 minutes
+- Few API requests: a new download only when fewer than 5 days are left, failed attempts are retried with growing pauses
+- Shows `--:--` until today's times are known
 - No modified libraries needed: the TA6932 driver is part of the sketch (`src/TA6932Chain`)
 - Credentials kept out of git (`secrets.h`)
 
@@ -156,9 +158,13 @@ sketch.
 ### Awqat Salah API access
 
 The API is free but requires an account. Request access on
-[awqatsalah.diyanet.gov.tr](https://awqatsalah.diyanet.gov.tr); you receive an
-e-mail address/password pair for the API. The API limits the number of requests
-per day, which is why the clock logs in and downloads only once a day.
+[awqatsalah.diyanet.gov.tr](https://awqatsalah.diyanet.gov.tr) (user request
+form); you receive an e-mail address/password pair for the API.
+
+The API limits the requests per endpoint and city (currently 10, 100 during the
+first 15 days of a new account; check your quota with `GET /api/Quota/My`).
+The clock therefore downloads a month at once (`/api/PrayerTime/Monthly/{cityId}`)
+and normally needs only about one request per month.
 
 ### Finding your city id
 
@@ -215,8 +221,10 @@ All settings are in [`config.h`](config.h):
 | `AWQAT_CITY_ID` | `"XXXXX"` | your city id |
 | `TIME_ZONE` | Central Europe | POSIX TZ string incl. DST rules |
 | `NTP_SERVER_1/2` | pool.ntp.org | time servers |
-| `FETCH_HOUR`, `FETCH_MINUTE` | 03:05 | daily download time |
-| `FETCH_RETRY_MS` | 5 min | retry interval after a failed download |
+| `AWQAT_RANGE` | `"Monthly"` | days per download: `"Monthly"`, `"Weekly"` or `"Daily"` |
+| `REFRESH_DAYS_AHEAD` | 5 | download again when fewer days (incl. today) are stored |
+| `FETCH_HOUR`, `FETCH_MINUTE` | 03:05 | time of the daily refresh attempt |
+| `FETCH_RETRY_MIN_MS`, `FETCH_RETRY_MAX_MS` | 5 min, 6 h | pause after a failed download while today is missing, doubles each time |
 | `WIFI_TIMEOUT_MS`, `NTP_TIMEOUT_MS` | 20 s, 10 s | how long start-up waits before continuing |
 | `DISPLAY_BRIGHTNESS` | 7 | 0 (dim) to 7 (bright) |
 | `TOP_LEFT_FIELD` | `FIELD_COUNTDOWN` | `FIELD_OFF`, `FIELD_COUNTDOWN` or `FIELD_HUMIDITY` |
@@ -240,22 +248,30 @@ Credentials go into `secrets.h` (ignored by git):
 ```
 setup()
  ├─ init display, show "--:--"
+ ├─ mount LittleFS, load the stored days (/prayer_times.bin)
  ├─ init I2C sensors (BME280 / DS3231), continue without them if missing
  ├─ connect Wi-Fi (max. 20 s, then continues in the background)
  └─ start NTP; if no sync within 10 s, set the system time from the DS3231
 
 loop()  (every 200 ms)
  ├─ after each NTP sync: write the time to the DS3231
- ├─ no prayer times yet, or new day after 03:05?
- │    └─ POST /Auth/Login → token → GET /api/PrayerTime/Daily/{cityId}
- │       (on failure: keep old times, retry after 5 min)
+ ├─ today not stored?                → download now, on failure retry after 5, 10, 20 … min (max. 6 h)
+ ├─ fewer than 5 days left, ≥ 03:05?  → one download attempt per day
+ │    download: POST /Auth/Login → token → GET /api/PrayerTime/Monthly/{cityId}
+ │              → merge with the stored days, drop past days, save to flash
  └─ new minute? → redraw prayer rows, countdown/humidity, temperature, clock and date
                   (only chips whose content changed are sent)
 ```
 
 - The system clock runs in UTC; the RTC stores local time.
-- JSON responses are streamed straight into ArduinoJson with a filter, so only
-  the six needed fields are kept in RAM.
+- The monthly response is parsed one day at a time with an ArduinoJson filter,
+  so it never has to fit into RAM as a whole. Days are matched by their date
+  (`gregorianDateShort`, e.g. `12.03.2023`), so it does not matter whether the
+  API returns the calendar month or the next 30 days.
+- The stored days are bound to `AWQAT_CITY_ID`; after changing the city the old
+  file is ignored and a new download starts.
+- Without internet the clock still needs the current time: on boards without
+  DS3231 the stored times are only shown once NTP has worked after a restart.
 - The HTTPS connection uses `setInsecure()`, i.e. the server certificate is
   **not verified**. This keeps the firmware independent of certificate
   renewals, but a network attacker could read the API credentials. Use a
@@ -277,7 +293,9 @@ loop()  (every 200 ms)
 | `HTTP -1 connection refused` | no internet or not enough free heap for TLS |
 | `BME280 not found` | check wiring and `BME280_I2C_ADDRESS` (0x76 or 0x77); sensor id 0x56-0x58 is a BMP280 without humidity |
 | `DS3231 not found` | check SDA/SCL wiring and the RTC supply |
-| Display stays `--:--` | no download yet, check the serial output |
+| Display stays `--:--` | today is not stored and no download worked yet, or the time is unknown; check the serial output |
+| `LittleFS not available` | ESP8266: choose a flash size with file system (e.g. *4MB (FS:2MB …)*) in the Tools menu |
+| `response contains no valid days` | the API answer changed; please open an issue with the serial output |
 | Clock/date board stays dark | `DISPLAY_CHIPS` is 2 or the chip 3 pins are wrong |
 | Board does not boot with the display connected | strapping pin pulled at power-up, see wiring |
 | Times are one hour off | wrong `TIME_ZONE` |
@@ -292,9 +310,9 @@ loop()  (every 200 ms)
 - [x] Temperature, humidity and countdown display
 - [x] Current time and date on the clock board
 - [x] ESP32 support
+- [x] Offline operation: monthly download stored in flash
 - [ ] Highlight the current prayer time
 - [ ] Wi-Fi setup without recompiling (captive portal, e.g. WiFiManager)
-- [ ] Download the monthly times as an offline buffer
 - [ ] Adhan / buzzer output at prayer time
 
 <p align="right">(<a href="#readme-top">back to top</a>)</p>
